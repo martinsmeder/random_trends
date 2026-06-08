@@ -5,7 +5,7 @@ import argparse
 import json
 import re
 from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from html import unescape
 from pathlib import Path
 from statistics import median
@@ -73,6 +73,13 @@ class ListingRecord:
 class ParsedPage:
     records: list[ListingRecord]
     next_page_url: Optional[str]
+
+
+@dataclass
+class MonthlyTrendPoint:
+    month: str
+    trend_price_per_sqm: float
+    based_on_sale_date: str
 
 
 KALIX_CENTRUM_1ROK = BooliMarketConfig(
@@ -258,6 +265,35 @@ def write_output(output_path: Path, payload: dict) -> None:
     output_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
 
 
+def build_monthly_trend_payload(
+    *,
+    market: BooliMarketConfig,
+    records: list[ListingRecord],
+) -> dict:
+    points = _build_monthly_trend_points(records)
+    return {
+        "market": market.name,
+        "source": market.source,
+        "scraped_at": _utc_now_iso(),
+        "query": {
+            "area_ids": list(market.area_ids),
+            "object_type": market.object_type,
+            "max_rooms": market.max_rooms,
+            "sort": market.sort,
+            "ascending": market.ascending,
+        },
+        "metric": "rolling_median_price_per_sqm_last_5_sales",
+        "frequency": "monthly",
+        "method": "carry_forward_latest_event_value_by_month_end",
+        "points": [asdict(point) for point in points],
+        "source_url": market.search_url,
+    }
+
+
+def derive_monthly_trend_output_path(output_path: Path) -> Path:
+    return output_path.with_name(f"{output_path.stem}_monthly_trend{output_path.suffix}")
+
+
 def main() -> int:
     args = parse_args()
     market = MARKETS[args.market]
@@ -287,8 +323,15 @@ def main() -> int:
         return 1
 
     payload = build_output_payload(market=market, records=records)
-    write_output(Path(args.output), payload)
-    print(f"Wrote {len(records)} records to {args.output}")
+    output_path = Path(args.output)
+    write_output(output_path, payload)
+
+    monthly_trend_payload = build_monthly_trend_payload(market=market, records=records)
+    monthly_trend_output_path = derive_monthly_trend_output_path(output_path)
+    write_output(monthly_trend_output_path, monthly_trend_payload)
+
+    print(f"Wrote {len(records)} records to {output_path}")
+    print(f"Wrote {len(monthly_trend_payload['points'])} monthly trend points to {monthly_trend_output_path}")
     return 0
 
 
@@ -397,6 +440,41 @@ def _compute_rolling_median(records: list[ListingRecord]) -> list[ListingRecord]
     return records
 
 
+def _build_monthly_trend_points(records: list[ListingRecord]) -> list[MonthlyTrendPoint]:
+    event_records = [
+        record for record in records if record.rolling_median_price_per_sqm_last_5_sales is not None
+    ]
+    if not event_records:
+        return []
+
+    points: list[MonthlyTrendPoint] = []
+    current_month = _month_start(_parse_iso_date(event_records[0].sold_date))
+    last_month = _month_start(_parse_iso_date(event_records[-1].sold_date))
+    current_index = 0
+    latest_record = event_records[0]
+
+    while current_month <= last_month:
+        month_end = _next_month_start(current_month)
+        while current_index < len(event_records):
+            candidate = event_records[current_index]
+            candidate_date = _parse_iso_date(candidate.sold_date)
+            if candidate_date >= month_end:
+                break
+            latest_record = candidate
+            current_index += 1
+
+        points.append(
+            MonthlyTrendPoint(
+                month=current_month.isoformat()[:7],
+                trend_price_per_sqm=float(latest_record.rolling_median_price_per_sqm_last_5_sales),
+                based_on_sale_date=latest_record.sold_date,
+            )
+        )
+        current_month = month_end
+
+    return points
+
+
 def _normalize_whitespace(text: str) -> str:
     return " ".join(text.replace("\xa0", " ").split())
 
@@ -419,6 +497,20 @@ def parse_area_ids_from_url(url: str) -> list[str]:
 
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _parse_iso_date(value: str) -> date:
+    return datetime.strptime(value, "%Y-%m-%d").date()
+
+
+def _month_start(value: date) -> date:
+    return value.replace(day=1)
+
+
+def _next_month_start(value: date) -> date:
+    if value.month == 12:
+        return value.replace(year=value.year + 1, month=1, day=1)
+    return value.replace(month=value.month + 1, day=1)
 
 
 if __name__ == "__main__":
