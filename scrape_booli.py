@@ -1,5 +1,7 @@
+#!/usr/bin/env python3
 from __future__ import annotations
 
+import argparse
 import json
 import re
 from dataclasses import asdict, dataclass
@@ -8,7 +10,7 @@ from html import unescape
 from pathlib import Path
 from statistics import median
 from typing import Optional, Union
-from urllib.parse import parse_qs, urljoin, urlparse
+from urllib.parse import parse_qs, urlencode, urljoin, urlparse
 
 from camoufox.sync_api import Camoufox
 from lxml import html
@@ -20,11 +22,35 @@ DEFAULT_MANUAL_CAPTCHA_TIMEOUT_MS = 300_000
 
 
 class BooliScrapeError(RuntimeError):
-    """Base error for scraper failures."""
+    pass
 
 
 class BooliBlockedError(BooliScrapeError):
-    """Raised when Booli/Cloudflare blocks access."""
+    pass
+
+
+@dataclass(frozen=True)
+class BooliMarketConfig:
+    name: str
+    source: str
+    area_ids: tuple[str, ...]
+    object_type: str
+    max_rooms: int
+    sort: str
+    ascending: bool
+
+    @property
+    def search_url(self) -> str:
+        query = urlencode(
+            {
+                "areaIds": ",".join(self.area_ids),
+                "maxRooms": self.max_rooms,
+                "objectType": self.object_type,
+                "sort": self.sort,
+                "ascending": int(self.ascending),
+            }
+        )
+        return f"{BOOLI_BASE_URL}/sok/slutpriser?{query}"
 
 
 @dataclass
@@ -47,6 +73,52 @@ class ListingRecord:
 class ParsedPage:
     records: list[ListingRecord]
     next_page_url: Optional[str]
+
+
+KALIX_CENTRUM_1ROK = BooliMarketConfig(
+    name="kalix_centrum_1rok",
+    source="booli",
+    area_ids=(
+        "83953",
+        "813757",
+        "84052",
+        "410631",
+        "84014",
+        "191823",
+        "384715",
+        "256034",
+        "310171",
+        "277786",
+        "813788",
+        "84028",
+    ),
+    object_type="Lägenhet",
+    max_rooms=1,
+    sort="soldDate",
+    ascending=True,
+)
+
+MARKETS = {KALIX_CENTRUM_1ROK.name: KALIX_CENTRUM_1ROK}
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Scrape Booli sold listings for a configured market.")
+    parser.add_argument("--market", default="kalix_centrum_1rok", choices=sorted(MARKETS.keys()))
+    parser.add_argument("--output", default="data/kalix_centrum_1rok.json")
+    parser.add_argument("--html-file", help="Optional local HTML file to parse instead of scraping live.")
+    parser.add_argument(
+        "--headful",
+        action="store_true",
+        help="Run the browser in headful mode. Required for manual captcha solving.",
+    )
+    parser.add_argument(
+        "--manual-captcha-timeout",
+        type=int,
+        default=300,
+        help="Seconds to wait after you press Enter for Booli results to appear.",
+    )
+    parser.add_argument("--max-pages", type=int, help="Optional page limit for debugging.")
+    return parser.parse_args()
 
 
 def parse_results_page(
@@ -77,18 +149,14 @@ def parse_results_page(
         sold_date_text = _first_text(link.xpath(".//span[contains(@class, 'object-card__date--logo')]"))
         data_items = link.xpath(".//ul[contains(@class, 'object-card__data-list')]/li")
 
-        size_sqm = _parse_metric_value(data_items, "kvadratmeter")
-        rooms = _parse_metric_value(data_items, "rum")
-        price_per_sqm = _parse_metric_value(data_items, "kr/kvadratmeter")
-
         record = ListingRecord(
             listing_id=_extract_listing_id(href),
             address=address,
             sold_date=_normalize_date(sold_date_text),
             sold_price=int(_parse_number(price_text)),
-            price_per_sqm=int(price_per_sqm),
-            size_sqm=size_sqm,
-            rooms=rooms,
+            price_per_sqm=int(_parse_metric_value(data_items, "kr/kvadratmeter")),
+            size_sqm=_parse_metric_value(data_items, "kvadratmeter"),
+            rooms=_parse_metric_value(data_items, "rum"),
             booli_url=urljoin(BOOLI_BASE_URL, href),
             source_url=page_url,
             area_ids=area_ids,
@@ -109,7 +177,6 @@ def scrape_market(
     max_pages: Optional[int] = None,
     timeout_ms: int = DEFAULT_TIMEOUT_MS,
     manual_captcha_timeout_ms: int = DEFAULT_MANUAL_CAPTCHA_TIMEOUT_MS,
-    deduplicate: bool = False,
 ) -> list[ListingRecord]:
     scraped_at = _utc_now_iso()
     records: list[ListingRecord] = []
@@ -117,17 +184,11 @@ def scrape_market(
     next_url: Optional[str] = url
     page_number = 0
 
-    with Camoufox(
-        headless=headless,
-        humanize=True,
-        locale="sv-SE",
-        enable_cache=True,
-    ) as browser:
+    with Camoufox(headless=headless, humanize=True, locale="sv-SE", enable_cache=True) as browser:
         page = browser.new_page()
         while next_url:
             if next_url in seen_urls:
                 break
-
             if max_pages is not None and page_number >= max_pages:
                 break
 
@@ -153,7 +214,7 @@ def scrape_market(
 
         page.close()
 
-    return _finalize_records(records, deduplicate=deduplicate)
+    return _compute_rolling_median(records)
 
 
 def scrape_from_html_file(
@@ -161,7 +222,6 @@ def scrape_from_html_file(
     *,
     page_url: str,
     area_ids: list[str],
-    deduplicate: bool = False,
 ) -> list[ListingRecord]:
     parsed = parse_results_page(
         html_path.read_text(),
@@ -169,40 +229,67 @@ def scrape_from_html_file(
         area_ids=area_ids,
         scraped_at=_utc_now_iso(),
     )
-    return _finalize_records(parsed.records, deduplicate=deduplicate)
+    return _compute_rolling_median(parsed.records)
 
 
 def build_output_payload(
     *,
-    market: str,
-    source: str,
-    source_url: str,
-    area_ids: list[str],
-    object_type: str,
-    max_rooms: int,
-    sort: str,
-    ascending: bool,
+    market: BooliMarketConfig,
     records: list[ListingRecord],
 ) -> dict:
     return {
-        "market": market,
-        "source": source,
+        "market": market.name,
+        "source": market.source,
         "scraped_at": _utc_now_iso(),
         "query": {
-            "area_ids": area_ids,
-            "object_type": object_type,
-            "max_rooms": max_rooms,
-            "sort": sort,
-            "ascending": ascending,
+            "area_ids": list(market.area_ids),
+            "object_type": market.object_type,
+            "max_rooms": market.max_rooms,
+            "sort": market.sort,
+            "ascending": market.ascending,
         },
         "records": [asdict(record) for record in records],
-        "source_url": source_url,
+        "source_url": market.search_url,
     }
 
 
 def write_output(output_path: Path, payload: dict) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
+
+
+def main() -> int:
+    args = parse_args()
+    market = MARKETS[args.market]
+    area_ids = list(market.area_ids)
+
+    try:
+        if args.html_file:
+            records = scrape_from_html_file(
+                Path(args.html_file),
+                page_url=market.search_url,
+                area_ids=area_ids,
+            )
+        else:
+            records = scrape_market(
+                url=market.search_url,
+                area_ids=area_ids,
+                headless=not args.headful,
+                max_pages=args.max_pages,
+                manual_captcha_timeout_ms=args.manual_captcha_timeout * 1000,
+            )
+    except BooliBlockedError as exc:
+        print(f"Blocked: {exc}")
+        print("Try a headful run first: python3 scrape_booli.py --headful")
+        return 2
+    except BooliScrapeError as exc:
+        print(f"Scrape failed: {exc}")
+        return 1
+
+    payload = build_output_payload(market=market, records=records)
+    write_output(Path(args.output), payload)
+    print(f"Wrote {len(records)} records to {args.output}")
+    return 0
 
 
 def _get_page_html_after_manual_verification(
@@ -232,7 +319,6 @@ def _get_page_html_after_manual_verification(
             _raise_for_blocked_page(html_text)
         except BooliBlockedError:
             continue
-
         if _page_has_result_cards(html_text):
             return html_text
 
@@ -289,9 +375,7 @@ def _parse_number(text: str) -> float:
     if not match:
         raise BooliScrapeError(f"Could not parse numeric value from '{text}'.")
     value = float(match.group(0))
-    if value.is_integer():
-        return int(value)
-    return value
+    return int(value) if value.is_integer() else value
 
 
 def _normalize_date(text: str) -> str:
@@ -303,31 +387,14 @@ def _normalize_date(text: str) -> str:
 
 
 def _compute_rolling_median(records: list[ListingRecord]) -> list[ListingRecord]:
+    records = list(records)
     records.sort(key=lambda record: record.sold_date)
     values: list[int] = []
     for record in records:
         values.append(record.price_per_sqm)
         if len(values) >= 5:
-            window = values[-5:]
-            record.rolling_median_price_per_sqm_last_5_sales = median(window)
+            record.rolling_median_price_per_sqm_last_5_sales = median(values[-5:])
     return records
-
-
-def _finalize_records(records: list[ListingRecord], *, deduplicate: bool) -> list[ListingRecord]:
-    finalized = _deduplicate_records(records) if deduplicate else list(records)
-    return _compute_rolling_median(finalized)
-
-
-def _deduplicate_records(records: list[ListingRecord]) -> list[ListingRecord]:
-    deduplicated: list[ListingRecord] = []
-    seen: set[str] = set()
-    for record in records:
-        key = record.listing_id or record.booli_url
-        if key in seen:
-            continue
-        seen.add(key)
-        deduplicated.append(record)
-    return deduplicated
 
 
 def _normalize_whitespace(text: str) -> str:
@@ -344,11 +411,15 @@ def _page_has_result_cards(html_text: str) -> bool:
     return bool(document.xpath("//a[contains(@class, 'object-card-link')]"))
 
 
-def _utc_now_iso() -> str:
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
-
-
 def parse_area_ids_from_url(url: str) -> list[str]:
     query = parse_qs(urlparse(url).query)
     raw = query.get("areaIds", [""])[0]
     return [value for value in raw.split(",") if value]
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
