@@ -1,4 +1,5 @@
 research/
-data/
 __pycache__
+.agents
+.codex
 notes.txt
